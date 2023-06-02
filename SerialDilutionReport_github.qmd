@@ -1,0 +1,1040 @@
+---
+format:
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+editor: visual
+---
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(gt)
+library(stringr)
+library(readxl)
+library(wesanderson)
+date <- format(Sys.Date(),"%b %d %Y")
+
+# Sort data and calculate outliers
+## Function for adding step and series to the data, calculating MAD/outliers, and normalizing data to top concentration for plots
+## Alternating Dilution Series
+gnltabFxn <- function(x, norm){
+ltab <- x %>% 
+	mutate(col = as.double(col),
+	Step = ceiling(col/2)-1,
+	Series = case_when(
+		col%%2 == 0 ~ "Even",
+		TRUE ~ "Odd"),
+ 	Area = case_when(
+		`*Ejection Status` != "Ok" ~ 0,
+			TRUE ~ Area
+				 ),
+	  `Sample Type` = case_when(
+	  	col >20 ~ "Control",
+	  	TRUE ~ "DR"
+	  )) %>% 
+		group_by(`*Ejection Volume`) %>% 
+		mutate(median = median(`IS Area`), 
+		 mad = median(abs(`IS Area` - median(`IS Area`))),
+		 outlier = (`IS Area` > median+4.5*mad)|(`IS Area` < median-4.5*mad)
+		) %>% 
+	ungroup()
+
+gnltab <- ltab %>% 
+		mutate(temp=.[[norm]]) %>%
+		group_by(row,Series) %>%
+	  mutate(topArea=max(temp),
+	  			 normArea =  temp/topArea)
+}
+
+# Calculate and average Ratios:
+## Function to calculate ratios of the dilution steps and calculating the average ratio for each dilution series step
+## Bad ejection samples and outliers are omitted prior to averaging
+RatioFxn <- function(x,area, series, ejvol){
+	df1 <- x %>% 
+	filter(Series == series,
+				 `Sample Type` == "DR")%>%
+	arrange(as.double(col)) %>% 
+	split(.$row, drop = FALSE) %>% 
+	map(~exp(c(0,-diff(log(.[[area]]))))) %>% 
+	bind_rows() %>% 
+	rownames_to_column() %>% 
+	mutate(EjVol = ejvol,
+				 Step = as.double(rowname)-1) %>% 
+	select(-rowname, -EjVol) %>% 
+	pivot_longer(!Step,names_to = "row", values_to = "fold") 
+	
+	allData <- x %>% 
+		filter(Series == series)
+	
+	sumTbl <- left_join(df1,allData, by = c("row", "Step"))	
+
+SummaryTblfold <- sumTbl %>% 
+	filter(is.finite(fold),
+				 `*Ejection Status` == "Ok",
+				 outlier == FALSE) %>% 
+	group_by(Step) %>% 
+	summarize(ratio = mean(fold), sd.fold = sd(fold)) %>% 
+	mutate(`CV%.fold` = (sd.fold/ratio)*100,
+				 Series = series,
+				EjVol = ejvol) %>% 
+	select(-sd.fold)
+}
+
+#Calculate Ratios:
+## Function to calculate ratios of the dilution steps. Does not summarize them by step
+allRatioFxn <- function(x,area, series, ejvol){
+	df1 <- x %>% 
+	filter(Series == series,
+				 `Sample Type` == "DR")%>%
+	arrange(as.double(col)) %>% 
+	split(.$row, drop = FALSE) %>% 
+	map(~exp(c(0,-diff(log(.[[area]]))))) %>% 
+	bind_rows() %>% 
+	rownames_to_column() %>% 
+	mutate(EjVol = ejvol, 
+				 Step = as.double(rowname)-1)%>% 
+	select(-rowname, -EjVol) %>% 
+	pivot_longer(!Step,names_to = "row", values_to = "fold") #%>% 
+	allData <- x %>% 
+		filter(Series == series,
+				 `*Ejection Volume` == ejvol)
+	
+	sumTbl <- left_join(df1,allData, by = c("row", "Step"))
+}
+
+## For plotting each individual dilution series on the plate
+plotFxn <- function(x){
+	dfSample <- x %>% filter(`Sample Type` == "DR")
+	return(ggplot(dfSample,
+								aes(Step,normArea))+
+	geom_point(size = 1.5)+
+	geom_smooth(method="lm",se=FALSE, size = 0.75, aes(color = Series))+
+	geom_abline(slope=-log10(3),colour="gray41",linewidth=0.75,linetype=2)+
+	annotate(geom="text",x=3.5,y=0.001,size = 3,label="3-Fold",
+					 colour="gray41",hjust=1,vjust=1)+
+	scale_y_log10(label=as.character)+
+	labs(x="Dilution Step",
+			 y="Normalized Concentration",
+			 title = x$Plate
+			 )+
+	facet_wrap(~row)+
+	scale_color_manual(values = wes_palette("Royal1"))+
+	#scale_color_brewer(palette = "Set1")+
+	theme_minimal(base_size =12)+
+	theme(plot.title = element_text(size = 12)))+
+	guide_legend(title = "Series")
+}
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+# Load Data:
+dfAll <- readxl::read_excel("Plate00001-SampleData.xlsx") 
+rundate <- dfAll$`Acquisition Date & Time`[1]
+
+
+# Remove NA from data set:
+df <- dfAll %>% 
+	drop_na(`IS Area`, Area, `Area Ratio`) %>% 
+	mutate(Area = case_when(
+		Area == "N/A" ~ "0",
+		TRUE ~ as.character(`Area`)
+	),
+	`Area Ratio` = case_when(
+		`Area Ratio` == "N/A" ~ "0",
+		TRUE ~ as.character(`Area Ratio`)
+	),
+	Area = as.double(Area),
+	`Area Ratio` = as.double(`Area Ratio`),
+	`Sample Comment` = 1:n()
+	) %>% 
+	separate(`Vial Number`, into = c("row","col"), sep = 1)
+
+# Process Data using the Compound Area:
+gnltab <- gnltabFxn(df,"Area") %>% 
+		ungroup() 
+
+gnltabClean <- gnltab %>% 
+	filter(outlier == FALSE,
+				 `*Ejection Status` == "Ok") %>% 
+	ungroup()
+
+# Process Data using the Compound/Internal Standard Ratio
+gnltabRatio <- gnltabFxn(df,"Area Ratio") %>% 
+		ungroup() 
+
+gnltabRatioClean <- gnltabRatio %>% 
+	filter(outlier == FALSE,
+				 `*Ejection Status` == "Ok") %>% 
+	ungroup()
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Assess Echo MS Run Quality using the Internal Standard: 
+## P/F table for Echo MS: 
+Avg <- mean(gnltabClean$`IS Area`)
+
+ISAvg <- gnltabClean %>% 
+	mutate(StdDev = (`IS Area`-Avg)/Avg*100, 
+	bad = case_when(
+			StdDev < -20 ~ 'color_these', 
+			StdDev > 20 ~ 'color_these',
+			TRUE ~ 'not_these'))
+
+## CV Without Bad Ejections, With Outliers
+ISCV <- gnltab %>%
+	filter(`*Ejection Status` == "Ok") %>% 
+	summarize(mean=mean(`IS Area`), sd = sd(`IS Area`)) %>%
+	mutate(CV = sd/mean*100,
+				 Wells = "wOutliers")
+## CV Without Bad Ejections and without Outliers
+ISCVwoOL <- gnltabClean %>% 
+	summarize(mean=mean(`IS Area`), sd = sd(`IS Area`)) %>% 
+	mutate(CV = sd/mean*100,
+				 Wells = "noOutliers")
+
+## Combine the two for the table
+dfCV <- bind_rows(ISCV, ISCVwoOL) %>% 
+	select(-sd) %>% 
+	pivot_wider(values_from = c(mean, CV),names_from = Wells) 
+
+
+## List wells that did not eject properly
+badEject <- dfAll %>% 
+	filter(`*Ejection Status` != "Ok") %>% 
+	dplyr::select(`Vial Number`, `*Ejection Status`)
+
+
+## Calculate Outlier Frequency
+if(sum(gnltab$outlier) > 0){
+	outlierCount <- gnltab %>% 
+	ungroup() %>% 
+	add_count(outlier) %>% 
+	mutate(outlier_freq = mean(outlier)*100) %>% 
+	select(outlier_freq, n, outlier) %>% 
+	filter(outlier == TRUE) %>% 
+	distinct()
+}else{
+	outlierCount <- data.frame(n = "0", outlier_freq = "0", outlier = "TRUE")
+}
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# THE DR PLATE: Calculate AREA Dilution Ratios
+## Wells with bad ejection status and any IS outliers are removed in the function before summarizing
+## Summarized by step
+dfOdd <- RatioFxn(gnltab,"Area", "Odd","2.5") %>% 
+	mutate(rowname = as.character(Step+1))
+
+dfEven <- RatioFxn(gnltab,"Area", "Even","2.5") %>% 
+	mutate(rowname = as.character(Step+1))
+
+## Calculate all ratios without summarizing
+dfOddAll <- allRatioFxn(gnltab,"Area", "Odd", "2.5") %>% 
+	mutate(Grouping = case_when(
+		Step %in% 1:4 ~ "Stps1",
+		Step %in% 5:8 ~ "Stps2",
+		TRUE ~ "Stps3"
+	)) 
+
+dfEvenAll <- allRatioFxn(gnltab,"Area", "Even", "2.5") %>% 
+	mutate(Grouping = case_when(
+		Step %in% 1:4 ~ "Stps1",
+		Step %in% 5:8 ~ "Stps2",
+		TRUE ~ "Stps3"
+	))
+
+## Combine Odd and Even series
+## Remove internal standard outliers and bad ejection wells
+dfAllRatio <- bind_rows(dfOddAll, dfEvenAll) 
+dfAllRatioClean <- dfAllRatio %>% 
+	filter(`*Ejection Status` == "Ok",
+				 outlier == FALSE)
+
+## Calculate COMPOUND Outliers by Column
+## Internal Standard Outliers already removed
+dfOutliers <- dfAllRatioClean %>% 
+	group_by(col) %>% 
+	mutate(median = median(Area), 
+		 mad = median(abs(Area - median(Area))),
+		 outlierArea = (Area > median+4.5*mad)|(Area < median-4.5*mad))
+
+
+## Summarize overall ratio With Compound Outliers (no internal standard outliers)
+meanWith <- dfOutliers %>% 
+	ungroup() %>% 
+	filter(Step %in% 1:8) %>% 
+	summarize(mean_with = mean(fold), sd = sd(fold)) %>% 
+	mutate(CV_with = (sd/mean_with)*100) %>% 
+	select(-sd)
+
+## Summarize overall ratio Without Compound Outliers (no internal standard outliers)
+meanWO <- dfOutliers %>% 
+	ungroup() %>% 
+	filter(outlierArea == FALSE,
+				 Step %in% 1:8) %>% 
+	summarize(mean_wo = mean(fold), sd = sd(fold)) %>% 
+	mutate(CV_wo = (sd/mean_wo)*100) %>% 
+	select(-sd)
+
+## Compound Outlier frequency
+if(sum(dfOutliers$outlierArea) > 0){
+	dfOverallOut <- dfOutliers %>% 
+	ungroup() %>% 
+	add_count(outlierArea) %>% 
+	mutate(out_freq = mean(outlierArea)*100) %>% 
+	filter(outlierArea == TRUE) %>% 
+	select(n, out_freq) %>% 
+	distinct()
+}else{
+	dfOverallOut <- data.frame(n = "0", out_freq = "0")
+}
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# THE DR PLATE: Calculate AREA RATIO Dilution Ratios
+## Wells with bad ejection status and any IS outliers are removed in the function before summarizing
+## Summarized by step
+dfOddR <- RatioFxn(gnltabRatio,"Area Ratio", "Odd","2.5") %>% 
+	mutate(rowname = as.character(Step+1))
+
+dfEvenR <- RatioFxn(gnltabRatio,"Area Ratio", "Even","2.5") %>% 
+	mutate(rowname = as.character(Step+1))
+
+## Calculate all ratios without summarizing
+dfOddAllR <- allRatioFxn(gnltabRatio,"Area Ratio", "Odd", "2.5") %>% 
+	mutate(Grouping = case_when(
+		Step %in% 1:4 ~ "Stps1",
+		Step %in% 5:8 ~ "Stps2",
+		TRUE ~ "Stps3"
+	)) 
+
+dfEvenAllR <- allRatioFxn(gnltabRatio,"Area", "Even", "2.5") %>% 
+	mutate(Grouping = case_when(
+		Step %in% 1:4 ~ "Stps1",
+		Step %in% 5:8 ~ "Stps2",
+		TRUE ~ "Stps3"
+	))
+
+## Combine Odd and Even series
+## Remove internal standard outliers and bad ejection wells
+dfAllRatioR <- bind_rows(dfOddAllR, dfEvenAllR) 
+dfAllRatioRClean <- dfAllRatioR %>% 
+	filter(`*Ejection Status` == "Ok",
+				 outlier == FALSE)
+
+## Calculate COMPOUND Outliers by Column
+## Internal Standard Outliers already removed
+dfOutliersR <- dfAllRatioRClean %>% 
+	group_by(col) %>% 
+	mutate(median = median(`Area Ratio`), 
+		 mad = median(abs(Area - median(`Area Ratio`))),
+		 outlierArea = (`Area Ratio` > median+4.5*mad)|(`Area Ratio` < median-4.5*mad))
+
+
+## Summarize overall ratio With Compound Outliers (no internal standard outliers)
+meanWithR <- dfOutliersR %>% 
+	ungroup() %>% 
+	filter(Step %in% 1:8) %>% 
+	summarize(mean_with = mean(fold), sd = sd(fold)) %>% 
+	mutate(CV_with = (sd/mean_with)*100) %>% 
+	select(-sd)
+
+## Summarize overall ratio Without Compound Outliers (no internal standard outliers)
+meanWOR <- dfOutliersR %>% 
+	ungroup() %>% 
+	filter(outlierArea == FALSE,
+				 Step %in% 1:8) %>% 
+	summarize(mean_wo = mean(fold), sd = sd(fold)) %>% 
+	mutate(CV_wo = (sd/mean_wo)*100) %>% 
+	select(-sd)
+
+## Compound Outlier frequency
+if(sum(dfOutliersR$outlierArea) > 0){
+	dfOverallOutR <- dfOutliersR %>% 
+	ungroup() %>% 
+	add_count(outlierArea) %>% 
+	mutate(out_freq = mean(outlierArea)*100) %>% 
+	filter(outlierArea == TRUE) %>% 
+	select(n, out_freq) %>% 
+	distinct()
+}else{
+	dfOverallOutR <- data.frame(n = "0", out_freq = "0")
+}
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+## Pass fail Color functions
+color_ratio <- function(x){
+	out <- rep("black",length(x))
+	out[x %in% 2.8:3.2] <- "red"
+	out[is.character(x)] <- "black"
+	out
+}
+
+color_ratio2 <- function(x, limit){
+	out <- rep("black",length(x))
+	out[x>limit] <- "red"
+	out[is.character(x)] <- "black"
+	out
+}
+
+pf <- if(dfCV$CV_noOutliers >10){
+	"FAIL"
+} else if (dfCV$CV_wOutliers >10){
+	"FAIL"
+}else if (outlierCount$outlier_freq >5){
+	"FAIL"
+}else {
+	"PASS"
+}
+
+pfPlate <- if(meanWith$mean_with < 2.8|meanWith$mean_with >3.2){
+	"FAIL"
+}else if(meanWO$mean_wo < 2.8|meanWO$mean_wo >3.2){
+	"FAIL"
+}else{
+	"PASS"
+}
+
+colorTable <- if(pfPlate == "FAIL"){
+	"red"
+}else{
+	"darkgreen"
+}
+
+pfPlateR <- if(meanWithR$mean_with < 2.8|meanWithR$mean_with >3.2){
+	"FAIL"
+}else if(meanWOR$mean_wo < 2.8|meanWOR$mean_wo >3.2){
+	"FAIL"
+}else if(dfOverallOutR$out_freq > 5){
+	"FAIL"
+}else{
+	"PASS"
+}
+
+colorTableR <- if(pfPlateR == "FAIL"){
+	"red"
+}else{
+	"darkgreen"
+}
+
+pfOverall <- if(pf == "FAIL"){
+	"FAIL"
+}else if(pfPlate == "FAIL"){
+	"FAIL"
+}else if(pfPlateR == "FAIL"){
+	"FAIL"
+}else{
+	"PASS"
+}
+
+CVfxn <- if(meanWO$CV_wo > 20){
+	"high"
+}else if(meanWOR$CV_wo >20){
+	"high"
+}else{
+	"acceptable"
+}
+
+colorTest <- if(pf == "FAIL"){
+"red"}else{
+	"black"
+}
+
+colorTest2 <- if(pfPlate == "FAIL"){
+"red"}else{
+	"black"
+}
+
+colorTest2.5 <- if(pfPlateR == "FAIL"){
+"red"}else{
+	"black"
+}
+
+colorTest3 <- if(pfOverall == "FAIL"){
+"red"}else{
+	"black"
+}
+```
+
+### EchoMS Run Details
+
+::: {style="line-height:1em"}
+Plate run on EchoMS on `r rundate`. Report prepared on `r date`
+
+Added 50 μL of 30% ACN with 400 ng/mL Warfarin to each well and centrifuged at 2000 rmp for 5 minutes.
+
+AE Method: 2.5 nL injection, 400 μL/min flow rate, and 2000 ms intervals
+:::
+
+### Results
+
+::: {style="color: `r colorTest2`"}
+Evaluation of Serial Dilution Plate (Area): `r pfPlate`
+:::
+
+::: {style="color: `r colorTest2.5`"}
+Evaluation of Serial Dilution Plate (Area Ratio): `r pfPlateR`
+:::
+
+::: {style="color: `r colorTest`"}
+Evaluation of the Echo MS Method: `r pf`
+:::
+
+::: {style="color: `r colorTest3`"}
+#### Overall Plate Status: `r pfOverall`
+:::
+
+### Dilutions Summary
+
+::: panel-tabset
+## Summary
+
+::: panel-tabset
+## Without Internal Standard Normalization
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+## Dilution Series Pass/Fail Table - data based on compound area
+bind_cols(meanWith,meanWO,dfOverallOut) %>% 
+	select(1,3,2,4:6) %>% 
+	gt() %>% 
+	fmt_number(decimals = 2, columns = !n) %>% 
+	cols_label(n = "Count",
+										out_freq = "outlier frequency",
+										mean_with = "with outliers",
+										mean_wo = "without outliers",
+										CV_with = "with outliers", 
+										CV_wo = "without Outliers") %>% 
+	tab_spanner(columns = 1:2, label = "Avg 3-Fold") %>% 
+	tab_spanner(columns = 3:4, label = "% CV") %>% 
+	tab_spanner(columns = 5:6, label = "Outliers") %>% 
+ data_color(columns = c("mean_with", "mean_wo"), palette = color_ratio, apply_to = "text") %>% 
+	data_color(columns = "out_freq", fn = function(x) color_ratio2(x,5),apply_to = "text") %>% 
+	tab_header(paste0("Plate Status: ", pfPlate)) %>% 
+	tab_options(heading.background.color = colorTable) %>% 
+	tab_footnote(footnote = "Including wells where compound area was outside the acceptable deviation from the median, calculated by column (n=16)", 
+							 locations = cells_column_labels(columns = c("mean_with", "CV_with"))) %>% 
+	tab_footnote(footnote = "Without wells where compound area was outside the acceptable deviation from the median, calculated by column (n=16)", 
+							 locations = cells_column_labels(columns = c("mean_wo", "CV_wo"))) %>% 
+	tab_footnote(footnote = "of compound, by column", 
+							 locations = cells_column_spanners(spanners = "Outliers")) %>% 
+	tab_footnote(footnote = "Calculated using raw area of compound", 
+							 locations = cells_column_spanners(spanners = "Avg 3-Fold")) %>% 
+	tab_source_note("Wells that did not pass internal standard evaluation were removed so data is not skewed by any issues on the Echo MS")
+```
+
+## With Internal Standard Normalization 
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+## Dilution Series Pass/Fail Table - data based on compound/internal standard area ratio
+bind_cols(meanWithR,meanWOR,dfOverallOutR) %>% 
+	select(1,3,2,4:6) %>% 
+	gt() %>% 
+	fmt_number(decimals = 2) %>% 
+	cols_label(n = "Count",
+										out_freq = "outlier frequency",
+										mean_with = "with outliers",
+										mean_wo = "without outliers",
+										CV_with = "with outliers", 
+										CV_wo = "without Outliers") %>% 
+	tab_spanner(columns = 1:2, label = "Avg 3-Fold") %>% 
+	tab_spanner(columns = 3:4, label = "% CV") %>% 
+	tab_spanner(columns = 5:6, label = "Outliers") %>% 
+ data_color(columns = c("mean_with", "mean_wo"), 
+ 					 palette = color_ratio, apply_to = "text") %>% 
+	data_color(columns = "out_freq", 
+						 fn = function(x) color_ratio2(x,5),
+						 apply_to = "text") %>% 
+	tab_header(paste0("Plate Status: ", pfPlateR)) %>% 
+	tab_options(heading.background.color = colorTableR) %>% 
+	tab_footnote(footnote = "Including wells where compound area was outside the acceptable deviation from the median, calculated by column (n=16)", 
+							 locations = cells_column_labels(columns = c("mean_with", "CV_with"))) %>% 
+	tab_footnote(footnote = "Without wells where compound area was outside the acceptable deviation from the median, calculated by column (n=16)", 
+							 locations = cells_column_labels(columns = c("mean_wo", "CV_wo"))) %>% 
+	tab_footnote(footnote = "of compound, by column", 
+							 locations = cells_column_spanners(spanners = "Outliers")) %>% 
+	tab_footnote(footnote = "Calculated using raw area of compound", 
+							 locations = cells_column_spanners(spanners = "Avg 3-Fold")) %>% 
+	tab_source_note("Wells that did not pass internal standard evaluation were removed so data is not skewed by any issues on the Echo MS")
+```
+:::
+
+See [Outlier Details] for removed wells based on internal standard outliers.
+
+See [Compound Outliers] for details about compound outliers.
+
+-   [**Criteria for Pass/Fail:**]{.underline}
+
+    EchoMS Method/Internal Standard:
+
+    -   Coefficient of Variation %: \< 20% for both with and without outliers
+    -   Outlier frequency: \< 5%
+
+    Serial Dilutions: Overall Serial Dilution Ratio must be between 2.8 - 3.2
+
+## Detailed Tables
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+#### Summary Table
+percAreaE <- gnltabClean %>% 
+	filter(Area != 0,
+				 Series == "Even") %>%
+	mutate(percArea = normArea*100) %>% 
+	group_by(Step) %>% 
+	summarize(Conc = mean(percArea), sd.conc = sd(percArea)) %>% 
+	mutate(CV.conc = (sd.conc/Conc)*100,
+				 rowname = as.character(Step+1))
+
+sumTblE <- right_join(dfEven,percAreaE, by = "rowname") %>% 
+	select(rowname, Conc, CV.conc, ratio, `CV%.fold`) %>% 
+	mutate(Series = "Even Columns", 
+				 IS = "Without IS")
+
+
+percAreaO <- gnltabClean %>% 
+	filter(Area != 0, 
+				 Series == "Odd") %>% 
+	mutate(percArea = normArea*100) %>% 
+	group_by(Step) %>% 
+	summarize(Conc = mean(percArea), sd.conc = sd(percArea)) %>% 
+	mutate(CV.conc = (sd.conc/Conc)*100,
+		rowname = as.character(Step+1))
+
+sumTblO <- right_join(dfOdd,percAreaO, by = "rowname") %>% 	
+	select(rowname, Conc, CV.conc, ratio, `CV%.fold`) %>% 
+	mutate(Series = "Odd Columns", 
+				 IS = "Without IS")
+
+sumTbl <- bind_rows(sumTblE,sumTblO)
+
+### With IS
+percAreaEIS <- gnltabRatioClean %>% 
+	filter(Area != 0,
+				 Series == "Even") %>%
+	mutate(percArea = normArea*100) %>% 
+	group_by(Step) %>% 
+	summarize(Conc = mean(percArea), sd.conc = sd(percArea)) %>% 
+	mutate(CV.conc = (sd.conc/Conc)*100,
+				 rowname = as.character(Step+1))
+
+sumTblEIS <- right_join(dfEvenR,percAreaEIS, by = "rowname") %>% 
+	select(rowname, Conc, CV.conc, ratio, `CV%.fold`) %>% 
+	mutate(Series = "Even Columns", 
+				 IS = "With IS")
+
+
+percAreaOIS <- gnltabRatioClean %>% 
+	filter(Area != 0, 
+				 Series == "Odd") %>% 
+	mutate(percArea = normArea*100) %>% 
+	group_by(Step) %>% 
+	summarize(Conc = mean(percArea), sd.conc = sd(percArea)) %>% 
+	mutate(CV.conc = (sd.conc/Conc)*100,
+		rowname = as.character(Step+1))
+
+sumTblOIS <- right_join(dfOddR,percAreaOIS, by = "rowname") %>% 	
+	select(rowname, Conc, CV.conc, ratio, `CV%.fold`) %>% 
+	mutate(Series = "Odd Columns", 
+				 IS = "With IS")
+
+sumTblIS <- bind_rows(sumTblEIS,sumTblOIS)
+
+sumTblAll <- left_join(sumTblIS, sumTbl, by = c("rowname", "Series"))
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+sumTblAll %>% select(-IS.x, -IS.y) %>% 
+	group_by(Series) %>% 
+	gt() %>% 
+	fmt_number(decimals = 2) %>% 
+	cols_label(Conc.x = "% Area",
+						 CV.conc.x = "% CV",
+						 ratio.x = "Ratio",
+						 `CV%.fold.x` = "% CV",
+						 Conc.y = "% Area",
+						 CV.conc.y = "% CV",
+						 ratio.y = "Ratio",
+						 `CV%.fold.y` = "% CV") %>% 
+	tab_spanner(columns = 2:5, label = "With IS") %>% 
+	tab_spanner(columns = 7:10, label = "Without IS") %>%  
+	tab_stubhead(label = "Step") %>% 
+	tab_source_note(html("Wells that did not pass IS evaluation are removed so data is not skewed by any issues on the EchoMS.<br> Compound Outliers were not removed.")) %>% 
+	tab_footnote(locations = cells_column_spanners("With IS"), 
+							 footnote = "Ratios calculated using internal standard-area ratio") %>% 
+		tab_footnote(locations = cells_column_spanners("Without IS"), 
+								 footnote = "Ratios calculated using raw area of Carbamazepine")
+
+```
+
+See [Outlier Details] for removed wells.
+
+## Plots
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-width: 10
+#| fig-height: 8
+
+plotFxn(gnltabClean)
+```
+
+## Compound Outliers
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+dfRow <- dfOutliers %>% 
+	group_by(Series, row) %>% 
+	add_count(outlierArea) %>% 
+	mutate(out_freq = mean(outlierArea)*100) %>% 
+	filter(outlierArea == TRUE) %>% 
+	select(row, col,Step, Series, n, out_freq)
+dfCol <- dfOutliers %>% 
+	group_by(Series, col) %>% 
+	add_count(outlierArea) %>% 
+	mutate(out_freq = mean(outlierArea)*100) %>% 
+	filter(outlierArea == TRUE) %>% 
+	select(row, col,Step, Series, n, out_freq)
+
+dfRow %>% 
+	select(-col, -Step) %>% 
+	distinct() %>% 
+	group_by(Series) %>% 
+	gt() %>% 
+	cols_label(row = "Row",
+										n = "# Outliers",
+										out_freq = "Frequency") %>% 
+	tab_header("Outliers by Row")
+	
+
+
+dfCol %>% 
+	group_by(Series) %>% 
+	select(-row) %>% 
+	distinct() %>% 
+	gt() %>% 
+	cols_label(col = "Column",
+										n = "# Outliers",
+										out_freq = "Frequency") %>% 
+		tab_header("Outliers by Column")
+```
+
+## Heatmaps
+
+::: panel-tabset
+## Pass/Fail Heatmap
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-width: 8
+#| fig-height: 8
+#| fig-align: center
+
+#### Heatmap zoomed in on specific data
+dfAllRatio %>% 
+	mutate(foldEdit = case_when(
+		fold >= 3.2 & Step > 0~ 3,
+		fold <= 2.8 & Step > 0~ 1,
+		TRUE & Step > 0 ~ 2,
+		Step == 0 ~ NA
+	),
+	fold = signif(fold,2))  %>% 
+ggplot(aes(x = col, y = reorder(row, -Index), fill = foldEdit))+ 
+	geom_tile(color = "grey50") +
+	geom_text(aes(label = fold), size = 4)+
+	scale_fill_distiller(n.breaks =7,
+											 palette = "RdBu"
+											)+ 
+	guides(fill = guide_colorbar(barwidth = 1, barheight = 7, raster = TRUE, 
+															 ticks = TRUE, draw.llim = TRUE, draw.ulim = TRUE,
+															 nbin = 5))+
+	scale_x_continuous(n.breaks = 20, 
+										 limits = c(0,21),
+										 expand = c(0, -0.5)
+										 )+
+labs(fill = "Dilution Ratios",
+		 title = "Wells between 2.8-3.2 colored white, higher ratios colored red, lower ratios colored blue",
+		 x = element_blank(), 
+		 y = element_blank())+
+	coord_equal() +
+	theme_bw()+
+		theme(plot.title = element_text(size = 12, hjust = 0.5),
+				plot.subtitle = element_text(size = 15),
+				legend.title = element_text(size = 15),
+				legend.position = "none",
+				legend.justification = c("right", "top"),
+				legend.box.just = "left",
+				legend.margin = margin(-6,-6,-6,-6))
+```
+
+## Detailed Heatmap
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-width: 8
+#| fig-height: 8
+#| fig-align: center
+
+#### Heatmap of plate layout
+dfAllRatio %>% 
+	mutate(fold = signif(fold,2)) %>% 
+ggplot(aes(x = col, y = reorder(row,-Index), fill = fold))+ 
+	geom_tile(color = "grey50") +
+	geom_text(aes(label = fold), size = 4)+
+	scale_fill_distiller(n.breaks =7,
+											 palette = "RdBu"
+											)+ 
+	guides(fill = guide_colorbar(barwidth = 1, barheight = 7, raster = TRUE, 
+															 ticks = TRUE, draw.llim = TRUE, draw.ulim = TRUE,
+															 nbin = 5))+
+	scale_x_continuous(n.breaks = 20, 
+										 limits = c(0,21),
+										 expand = c(0, -0.5)
+										 )+
+labs(fill = "Dilution Ratios",
+		 x = element_blank(), 
+		 y = element_blank())+
+	coord_equal() +
+	theme_bw()+
+	theme(plot.title = element_text(size = 10),
+				legend.title = element_text(size = 8)
+				)
+```
+
+## Values Only
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+rawnum <- dfAllRatio %>% 
+	select(col, fold, row) %>% 
+	arrange(col) %>% 
+	pivot_wider(names_from = col, values_from = fold)
+
+#write_csv(rawnum, paste0("allFold",barcode,".csv"))
+
+rawnum %>% select(-2:-3) %>% 
+	gt(rowname_col = "row") %>% 
+	fmt_number(decimals = 1)  %>% 
+	tab_caption(caption = "All Fold") %>% 
+	data_color(columns = everything(),fn = color_ratio, apply_to = "text")
+```
+:::
+:::
+
+### Echo MS QC
+
+::: panel-tabset
+## Echo MS Internal Standard Summary
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+pfEcho <- if(outlierCount$outlier_freq > 5){
+	"FAIL"
+}else if(dfCV$CV_wOutliers > 10){
+	"FAIL"
+}else if(dfCV$CV_noOutliers > 10){
+	"FAIL"
+}else{
+	"PASS"
+}
+
+colorTable2 <- if(pfEcho == "FAIL"){
+	"red"
+}else{
+	"darkgreen"
+}
+
+bind_cols(outlierCount,dfCV) %>% 
+	select(-mean_noOutliers, -outlier) %>% 
+	gt() %>% 
+	fmt_number(decimals = 2, columns = !n) %>% 
+	cols_label(outlier_freq = "Frequency",
+										n = "Count",
+										mean_wOutliers = "Mean Area",
+										CV_wOutliers = "with outliers",
+										CV_noOutliers = "without outlers") %>% 
+	tab_spanner(columns = 4:5, label = "% CV") %>% 
+	tab_spanner(columns = 1:2, label = "Outliers") %>% 
+	tab_footnote(footnote = "of internal standard, by plate", 
+							 locations = cells_column_spanners(spanner = "Outliers")) %>% 
+ data_color(columns = c("CV_wOutliers", "CV_noOutliers"), 
+ 					 fn = function(x) color_ratio2(x,10), 
+ 					 apply_to = "text") %>% 
+	data_color(columns = "outlier_freq", 
+						 fn = function(x) color_ratio2(x,5),
+						 apply_to = "text") %>% 
+	tab_header(paste0("Plate Status: ", pfEcho)) %>% 
+	tab_options(heading.background.color = colorTable2) 
+
+
+badEject %>% gt %>% 
+	tab_header(html("Wells with MS Ejection Issues <br><small> (These are eliminated from calculations)"))
+
+```
+
+## Std Dev Plot
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-width: 5
+#| fig-height: 3
+#| fig-align: center
+
+
+### Plot internal standard
+ggplot(ISAvg,aes(x = `Sample Comment`, y = StdDev, color = bad))+
+	geom_point(size = 1)+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5),
+  									 limits = c(-50,50))+
+	scale_x_continuous(breaks = scales::pretty_breaks(n = 10))+
+	labs(x = "", 
+			 y = "Internal Standard Std Deviation",
+			 title = "Internal Standard")+
+	geom_hline(yintercept = c(-20,20), 
+						 color = "grey0",
+						 linewidth = 1)+
+	theme_classic()+
+	theme(panel.grid.major.y = element_line(color = "grey64",
+																					linewidth = 0.5, 
+																					linetype = 1),
+				legend.position="none")+
+	scale_color_brewer(palette = "Set1")+
+	theme(plot.title = element_text(size = 10))
+
+ISAvg %>% 
+	unite(`Vial Number`, row, col, sep = "") %>% 
+	select(StdDev,`Vial Number`) %>% 
+	filter(StdDev >= 20| StdDev <= -20) %>% 
+	arrange(-StdDev) %>% 
+	gt() %>% 
+	tab_header("Wells with > 20 dev from Avg") %>% 
+	fmt_number(decimals = 2) 
+```
+
+## Distribution Plot
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-height: 4
+#| fig-width: 4
+#| fig-align: center
+
+
+df %>% 
+	ggplot(aes(sample = `IS Area`))+
+	stat_qq(color = "blue", size = 1)+
+	stat_qq_line()+
+	labs(x="", y="", title = "Distribution of Internal Standard")+
+	theme_bw(base_size=12)
+```
+
+## Outlier Details
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+gnltab %>% 
+	filter(outlier == TRUE) %>% 
+	unite(`Vial Number`, row, col, sep = "") %>% 
+	select(`Vial Number`, outlier, Series) %>% 
+	gt() %>% 
+	cols_label(outlier = "Outlier") %>% 
+	tab_header("Wells that are IS outliers") 
+```
+
+## Areas
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-width: 6
+#| fig-height: 6
+#| fig-align: center
+
+gnltab %>% filter(Series == "Odd") %>% 
+ggplot()+
+	geom_point(aes(x = col, y = log10(Area)), color = "blue")+
+	geom_point(aes(x = col, y = log10(`IS Area`)), color = "red")+
+	theme_bw()+
+	labs(x = "Column",
+			 title = "Odd Series: Carbamazepine and Warfarin Area",
+			 subtitle = "Blue: Carbamazepine, Red: Warfarin") +
+	facet_wrap(~row)
+
+
+gnltab %>% filter(Series == "Even") %>% 
+ggplot()+
+	geom_point(aes(x = col, y = log10(Area)), color = "blue")+
+	geom_point(aes(x = col, y = log10(`IS Area`)), color = "red")+
+	theme_bw()+
+	labs(x = "Column",
+			 title = "Even Series: Carbamazepine and Warfarin Area",
+			 subtitle = "Blue: Carbamazepine, Red: Warfarin") +
+	facet_wrap(~row)
+```
+:::
